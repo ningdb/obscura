@@ -9,17 +9,81 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # 将 Linux 编译拆离出来，使用容器化方案
+  build-linux:
+    runs-on: ubuntu-latest
+    # 强制将整个作业的运行环境切换为 CentOS 7 官方容器
+    container:
+      image: centos:7
+    steps:
+      # 1. 修复 CentOS 7 停止维护(EOL)导致的 yum 源失效问题
+      - name: Fix yum repos (CentOS 7 EOL)
+        run: |
+          sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/CentOS-*.repo
+          sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/CentOS-*.repo
+          sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/CentOS-*.repo
+          yum clean all
+          yum makecache
+
+      # 2. 手动安装基础工具（容器内默认缺失）
+      - name: Install dependencies
+        run: |
+          yum install -y git make gcc
+
+      # 3. 手动拉取代码
+      # 避开官方 actions/checkout 插件，防止 glibc/Node.js 报错崩溃
+      - name: Manual Checkout
+        run: |
+          git clone --depth 1 --branch ${{ github.ref_name }} github.com{{ github.repository }}.git .
+
+      # 4. 在 CentOS 7 环境内原生安装 Rust
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      # 5. 原生编译
+      - name: Build
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release
+
+      # 6. 原生编译 stealth
+      - name: Build stealth
+        run: |
+          source $HOME/.cargo/env
+          cargo build --release --features stealth
+        continue-on-error: true
+
+      # 7. 打包产物
+      - name: Package
+        run: |
+          cd target/release
+          tar czf ../../obscura-x86_64-linux.tar.gz obscura obscura-worker
+          cd ../..
+
+      # 8. 发布 Release（在容器中直接用 curl 调用 GitHub API 上传，不依赖插件）
+      - name: Upload Release Asset
+        run: |
+          ASSET_NAME="obscura-x86_64-linux.tar.gz"
+          TAG_NAME="${{ github.ref_name }}"
+          
+          # 获取 Release ID
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "github.com{{ github.repository }}/releases/tags/${TAG_NAME}" | grep -m 1 '"id":' | awk '{print $2}' | tr -d ',')
+          
+          # 上传二进制包
+          curl -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+               -H "Content-Type: application/gzip" \
+               --data-binary @"${ASSET_NAME}" \
+               "github.com{{ github.repository }}/releases/${RELEASE_ID}/assets?name=${ASSET_NAME}"
+
+  # 保留其他非 Linux 平台的编译（它们继续走原本的逻辑）
+  build-others:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
-            # Build on Ubuntu 22.04 so the Linux release binary works on
-            # common LTS servers with glibc 2.35 instead of requiring the
-            # newer glibc shipped by ubuntu-latest.
-            os: ubuntu-22.04
-            name: obscura-x86_64-linux
           - target: aarch64-apple-darwin
             os: macos-latest
             name: obscura-aarch64-macos
